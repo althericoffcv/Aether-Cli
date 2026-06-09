@@ -1,0 +1,18 @@
+{
+  "name": "aether-cli",
+  "version": "2.0.0",
+  "description": "AETHER — AI Development Partner powered by Gemini",
+  "type": "module",
+  "bin": {
+    "aether": "./bin/aether.js"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "start": "node bin/aether.js",
+    "test": "node bin/aether.js doctor"
+  },
+  "keywords": ["ai", "cli", "agent", "gemini", "coding", "autonomous", "aether"],
+  "license": "MIT"
+}
