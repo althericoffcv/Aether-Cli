@@ -1,11 +1,15 @@
-/**
- * code.mjs — aether code <task>
- * AUTO FIX MODE: silent tools, clean output, auto-retry on errors.
- */
 import readline          from 'readline'
+import { existsSync }    from 'fs'
+import { join }          from 'path'
 import { AetherAgent }   from '../agent/index.mjs'
-import { ui, spin }      from './ui.mjs'
+import { ui, spin, smartStatus, thoughtToStatus } from './ui.mjs'
 import { initWorkspace } from '../config/index.mjs'
+
+const BUILD_CMDS   = /npm run build|pnpm build|yarn build|vite build|tsc |next build|bun run build/
+const SERVER_CMDS  = /npm run dev|pnpm dev|yarn dev|vite$|next dev|bun dev|npm (run )?start/
+const TEST_CMDS    = /npm run test|jest |vitest|mocha |pytest/
+const INSTALL_CMDS = /npm install|pnpm install|yarn install|bun install/
+const BUILD_DIRS   = ['dist','build','.next','out','.output']
 
 export async function runCode(task, options = {}) {
   ui.banner()
@@ -14,10 +18,8 @@ export async function runCode(task, options = {}) {
   if (!objective) {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
     objective = await new Promise(resolve => {
-      rl.question(
-        '\x1b[1m\x1b[33m⚡ What should AETHER do?\x1b[0m\n\x1b[2m(e.g. "create a REST API", "fix all TypeScript errors")\x1b[0m\n\n\x1b[1m› \x1b[0m',
-        ans => { rl.close(); resolve(ans.trim()) }
-      )
+      rl.question('\x1b[1m\x1b[33m⚡ What should AETHER do?\x1b[0m\n\x1b[2m(e.g. "create a REST API", "fix TypeScript errors")\x1b[0m\n\n\x1b[1m› \x1b[0m',
+        ans => { rl.close(); resolve(ans.trim()) })
     })
   }
   if (!objective) { ui.error('No task provided.'); process.exit(1) }
@@ -28,85 +30,90 @@ export async function runCode(task, options = {}) {
 
   await initWorkspace(workingDir)
 
-  console.log(`\x1b[1m\x1b[33m⚡ Task\x1b[0m`)
-  console.log(`  ${objective}\n`)
-  console.log(`\x1b[2m  📁 ${workingDir}  ·  max ${maxIterations} steps\x1b[0m\n`)
-  console.log('\x1b[90m' + '─'.repeat(54) + '\x1b[0m')
+  console.log(`\x1b[1m\x1b[33m⚡ Task\x1b[0m\n  ${objective}\n`)
+  console.log(`\x1b[2m  📁 ${workingDir}  ·  max ${maxIterations} steps\x1b[0m`)
+  console.log('\x1b[90m' + '─'.repeat(54) + '\x1b[0m\n')
 
-  let _lastTool   = null
-  let _lastParams = null
-
+  let _lastTool = null, _lastParams = null, _lastCmd = ''
+  let filesCreated = 0, filesUpdated = 0
   const startTime = Date.now()
+
+  spin.set('⏳ Understanding Request...')
 
   const agent = new AetherAgent({
     workingDir, maxIterations, verbose,
 
-    onStatus(text)   { spin.update(text) },
+    onStatus() {},                    // silent — we control the status line
+    onIteration() {},                 // no step counter
 
-    onIteration(i, max) {
-      spin.stop()
-      const bar = progressBar(i, max, 16)
-      console.log(`\n\x1b[90m── ${String(i).padStart(2)}/${max}  ${bar} ──\x1b[0m`)
-    },
-
-    // Thought: silent — just update spinner with a brief hint
     onThought(thought) {
-      const hint = thought.trim().split('.')[0].slice(0, 55)
-      if (hint) spin.update(hint + '…')
+      spin.set(thoughtToStatus(thought))
     },
 
-    // Action: clean status, no raw tool+params
     onAction(toolName, params) {
       _lastTool = toolName; _lastParams = params
-      spin.stop()
-      const cmd = String(params?.command ?? '')
-      if (toolName === 'execute_command') {
-        if (/npm (run )?build|tsc/.test(cmd))        { ui.buildStart(); return }
-        if (/npm install|pnpm install/.test(cmd))    { spin.start('Installing dependencies…'); return }
-        if (/npm (run )?test|jest|vitest/.test(cmd)) { spin.start('Running tests…'); return }
-        spin.start(`Running: ${cmd.slice(0, 55)}…`)
-        return
-      }
-      spin.start(toolStatusMsg(toolName, params))
+      _lastCmd  = String(params?.command ?? '').toLowerCase()
+      spin.set(smartStatus(toolName, params))
     },
 
-    // Observation: clean result — no raw output
     onObservation(obs) {
-      spin.stop()
       const tool   = _lastTool
       const params = _lastParams
+      const cmd    = _lastCmd
       const failed = obs.startsWith('ERROR') || obs.includes('COMMAND FAILED') || obs.startsWith('EXECUTOR ERROR')
-      const cmd    = String(params?.command ?? '')
 
       if (tool === 'execute_command') {
         if (failed) {
-          const errLine = obs.split('\n').map(l => l.trim())
-            .filter(l => l && !/^(npm warn|>|\s*$)/.test(l)).find(l => l.length > 2) ?? 'Command failed'
-          if (/npm (run )?build|tsc/.test(cmd)) ui.buildFail(errLine)
-          else console.log(`\x1b[33m⚠\x1b[0m  \x1b[2m${errLine.slice(0, 100)}\x1b[0m`)
-          console.log(`\x1b[36m↻\x1b[0m  Analyzing error… fixing automatically`)
-          spin.start('Analyzing…')
+          const reason = extractFirstError(obs)
+          if (BUILD_CMDS.test(cmd))  ui.buildFail(reason)
+          else if (SERVER_CMDS.test(cmd)) ui.serverFail(reason)
+          else if (TEST_CMDS.test(cmd))   ui.testFail(reason)
+          else { spin.stop(); console.log(`\x1b[31m✗\x1b[0m Command Failed\n\n  \x1b[1mReason:\x1b[0m\n  ${reason ?? ''}\n`) }
+          spin.set('🔧 Analyzing error...')
         } else {
-          if (/npm (run )?build|tsc/.test(cmd))        ui.buildSuccess()
-          else if (/npm (run )?test|jest|vitest/.test(cmd)) console.log(`\x1b[32m✓\x1b[0m Tests passed`)
-          else if (/npm install|pnpm install/.test(cmd))    console.log(`\x1b[32m✓\x1b[0m Dependencies installed`)
-          else {
-            const preview = obs.split('\n').filter(l => l.trim()).slice(0, 2).join(' ').slice(0, 100)
-            if (preview) console.log(`\x1b[32m✓\x1b[0m \x1b[2m${preview}\x1b[0m`)
+          if (BUILD_CMDS.test(cmd)) {
+            const hasOut = BUILD_DIRS.some(d => existsSync(join(workingDir, d)))
+            if (hasOut) ui.buildSuccess()
+            else        ui.buildNoOutput()
+          } else if (SERVER_CMDS.test(cmd)) {
+            const url = obs.match(/https?:\/\/localhost:\d+/i)?.[0]
+            if (url) ui.serverReady(url, null)
+            else     ui.cmdSuccess('Server started')
+          } else if (TEST_CMDS.test(cmd)) {
+            ui.testPass(extractTestSummary(obs))
+          } else if (INSTALL_CMDS.test(cmd)) {
+            ui.cmdSuccess('Dependencies Installed')
+          } else {
+            const line = obs.split('\n').filter(l => l.trim() && !l.startsWith('>')).slice(0,1).join('').slice(0,80)
+            if (line) { spin.stop(); console.log(`\x1b[32m✓\x1b[0m \x1b[2m${line}\x1b[0m`) }
           }
         }
         return
       }
 
-      const msg = cleanObservation(tool, params, obs)
-      if (msg) console.log(msg)
+      if (tool === 'start_server') {
+        if (failed || obs.startsWith('ERROR'))       ui.serverFail(obs)
+        else if (obs.includes('WARNING'))            ui.serverNotAccessible(obs.match(/URL tried: (\S+)/)?.[1])
+        else {
+          const localUrl = obs.match(/LOCAL: (\S+)/)?.[1]
+          const netUrl   = obs.match(/NETWORK: (\S+)/)?.[1]
+          ui.serverReady(localUrl, netUrl)
+        }
+        return
+      }
+
+      if (tool === 'write_file')                      { filesCreated++; spin.set(`📝 Writing files... [${filesCreated}]`); return }
+      if (tool === 'edit_file' || tool === 'append_file') { filesUpdated++; spin.set(`✏️ Updating files... [${filesUpdated}]`); return }
+      // Everything else: silent
     },
 
-    onFinalAnswer(answer) { spin.stop(); ui.finalAnswer(answer) },
+    onFinalAnswer(answer) {
+      spin.stop()
+      ui.finalAnswer(answer)
+    },
 
     onError(msg) {
-      spin.stop()
-      if (verbose) console.log(`\x1b[90m[debug] ${msg}\x1b[0m`)
+      if (verbose) { spin.stop(); console.log(`\x1b[90m[debug] ${msg}\x1b[0m`) }
     },
   })
 
@@ -114,68 +121,29 @@ export async function runCode(task, options = {}) {
     const result  = await agent.run(objective)
     spin.stop()
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
-    const mark    = result.success ? '\x1b[32m✓\x1b[0m' : '\x1b[33m⚠\x1b[0m'
-    console.log(`${mark} \x1b[2mDone · ${result.iterations} steps · ${elapsed}s\x1b[0m\n`)
-    if (!result.success) {
-      console.log('\x1b[2mRun again to continue.\x1b[0m\n')
-    }
+    const mark    = result.success ? '\x1b[32m✓\x1b[0m' : '\x1b[33m⚠️\x1b[0m'
+    console.log(`${mark} \x1b[2mDone in ${elapsed}s\x1b[0m\n`)
+    if (!result.success) console.log('\x1b[2mRun again to continue.\x1b[0m\n')
     return result
   } catch (err) {
     spin.stop()
     ui.error(`Agent failed: ${err.message}`)
-    const msg = (err.message ?? '').toLowerCase()
-    if (msg.includes('session') || msg.includes('fetch') || msg.includes('enotfound')) {
+    const m = (err.message ?? '').toLowerCase()
+    if (m.includes('session') || m.includes('fetch') || m.includes('enotfound'))
       console.log(`\n\x1b[33mTip:\x1b[0m Sign in at \x1b[36mhttps://gemini.google.com\x1b[0m then retry.\n`)
-    }
     if (verbose) console.error(err)
     process.exit(1)
   }
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-function toolStatusMsg(toolName, params) {
-  const p = params ?? {}
-  switch (toolName) {
-    case 'read_file':        return `Reading ${p.path ?? 'file'}…`
-    case 'write_file':       return `Writing ${p.path ?? 'file'}…`
-    case 'edit_file':        return `Updating ${p.path ?? 'file'}…`
-    case 'delete_file':      return `Deleting ${p.path ?? 'file'}…`
-    case 'create_directory': return `Creating ${p.path ?? 'directory'}…`
-    case 'list_directory':   return `Scanning ${p.path ?? '.'}…`
-    case 'project_scan':     return `Scanning project…`
-    case 'git_commit':       return `Committing…`
-    case 'git_push':         return `Pushing…`
-    default:                 return `Processing…`
-  }
+function extractFirstError(obs) {
+  return obs.split('\n').map(l => l.trim())
+    .filter(l => l && !/^(npm warn|>|npm notice)/.test(l) && !/^\s*at /.test(l))
+    .find(l => /error|failed|cannot|not found|invalid|missing/i.test(l))
+    ?? obs.split('\n').find(l => l.trim().length > 5)
+    ?? obs.slice(0, 120)
 }
 
-function cleanObservation(toolName, params, obs) {
-  const p  = params ?? {}
-  const ok = !obs.startsWith('ERROR') && !obs.includes('COMMAND FAILED') && !obs.startsWith('EXECUTOR ERROR')
-  const G  = '\x1b[32m✓\x1b[0m'
-  const E  = '\x1b[31m✗\x1b[0m'
-  switch (toolName) {
-    case 'write_file':       return ok ? `${G} Created:  \x1b[2m${p.path}\x1b[0m` : `${E} Failed: ${p.path}`
-    case 'edit_file':
-    case 'append_file':      return ok ? `${G} Updated:  \x1b[2m${p.path}\x1b[0m` : `${E} Failed: ${p.path}`
-    case 'delete_file':      return ok ? `${G} Deleted:  \x1b[2m${p.path}\x1b[0m` : `${E} Delete failed`
-    case 'create_directory': return ok ? `${G} Folder:   \x1b[2m${p.path}\x1b[0m` : `${E} Folder failed`
-    case 'git_commit':       return ok ? `${G} Committed` : `${E} Commit failed`
-    case 'git_push':         return ok ? `${G} Pushed`    : `${E} Push failed`
-    case 'start_server': {
-      if (!ok) return `${E} Server failed`
-      const url = obs.match(/https?:\/\/localhost:\d+[^\s]*/i)?.[0]
-      return url ? `${G} Server → \x1b[36m${url}\x1b[0m` : `${G} Server started`
-    }
-    case 'read_file': case 'list_directory': case 'search_files':
-    case 'project_scan': case 'memory_read': case 'memory_write':
-      return null
-    default:
-      return ok ? null : `${E} Error in ${toolName}`
-  }
-}
-
-function progressBar(current, total, width) {
-  const filled = Math.round(Math.min(current / total, 1) * width)
-  return '\x1b[32m' + '█'.repeat(filled) + '\x1b[90m' + '░'.repeat(width - filled) + '\x1b[0m'
+function extractTestSummary(obs) {
+  return obs.match(/(\d+ (test|spec|suite).{0,40})/i)?.[1] ?? null
 }

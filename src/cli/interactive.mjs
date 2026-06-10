@@ -1,58 +1,56 @@
 /**
  * interactive.mjs — Unified AETHER interactive mode
- * AUTO FIX MODE: silent tools, clean output, auto-retry on errors.
+ * EDIT MODE: single status line, smart emoji, auto-fix, clean output.
  */
 import readline             from 'readline'
 import { AetherAgent }      from '../agent/index.mjs'
-import { ui, spin }         from './ui.mjs'
+import { ui, spin, smartStatus, thoughtToStatus } from './ui.mjs'
 import { scanProject }      from '../scanner/index.mjs'
-import { initWorkspace,
-         getWorkspaceFiles } from '../config/index.mjs'
+import { initWorkspace, getWorkspaceFiles } from '../config/index.mjs'
 import { askGemini }        from '../providers/gemini.mjs'
 import { homedir }          from 'os'
 import { existsSync }       from 'fs'
 import { readFile }         from 'fs/promises'
+import { join }             from 'path'
 
-// ─── Task routing keywords ────────────────────────────────────────────────────
-const TASK_EN = /^\s*(create|make|build|write|fix|add|remove|delete|update|refactor|implement|generate|install|setup|init|configure|rename|move|copy|migrate|start|run|deploy|test|scaffold|debug|optimize|convert|fetch)\b/i
-const TASK_ID = /^\s*(buat|bikin|tulis|perbaiki|tambah|hapus|ubah|jalankan|mulai|pasang|konfigurasi|atur|pindah|salin|rename|deploy|debug|generate|buat|buatkan)\b/i
-const PROJ_GEN = /\b(website|landing.?page|web.?app|app|aplikasi|project|proyek|bot|dashboard|api|backend|frontend|portfolio|blog|toko|ecommerce|todo.?app|chat.?app|crud)\b/i
+const TASK_EN   = /^\s*(create|make|build|write|fix|add|remove|delete|update|refactor|implement|generate|install|setup|init|configure|rename|move|copy|migrate|start|run|deploy|test|scaffold|debug|optimize|convert|fetch)\b/i
+const TASK_ID   = /^\s*(buat|bikin|tulis|perbaiki|tambah|hapus|ubah|jalankan|mulai|pasang|konfigurasi|atur|pindah|salin|deploy|debug)\b/i
+const PROJ_GEN  = /\b(website|landing.?page|web.?app|app|aplikasi|project|proyek|bot|dashboard|api|backend|frontend|portfolio|blog|toko|ecommerce|todo.?app|chat.?app|crud)\b/i
 const DESTRUCTIVE = new Set(['delete_file','delete_directory','move_file','rename_file'])
+const BUILD_CMDS  = /npm run build|pnpm build|yarn build|vite build|tsc |next build|bun run build/
+const SERVER_CMDS = /npm run dev|pnpm dev|yarn dev|vite$|next dev|bun dev|npm (run )?start|node server|flask|uvicorn/
+const TEST_CMDS   = /npm run test|jest |vitest|mocha |pytest|bun test/
+const INSTALL_CMDS = /npm install|pnpm install|yarn install|bun install|pip install/
+const BUILD_OUT_DIRS = ['dist','build','.next','out','public/build','.output','www']
 
 function looksLikeTask(input) {
   return TASK_EN.test(input) || TASK_ID.test(input) ||
     (PROJ_GEN.test(input) && input.length > 15) ||
     /\.(js|ts|jsx|tsx|css|html|json|py|go|rs|md|yml|yaml|toml|sh|env)\b/i.test(input)
 }
-
 function looksLikeProjectGen(input) {
   return PROJ_GEN.test(input) && (TASK_EN.test(input) || TASK_ID.test(input))
 }
 
 // ─── Main entry ───────────────────────────────────────────────────────────────
 export async function runInteractive(options = {}) {
-  const {
-    workingDir  = process.cwd(),
-    config      = {},
-    verbose     = false,
-    directTask  = null,
-  } = options
+  const { workingDir = process.cwd(), config = {}, verbose = false, directTask = null } = options
 
   ui.banner()
   await initWorkspace(workingDir)
 
-  spin.start('Scanning workspace…')
+  spin.set('🔍 Scanning workspace...')
   let projectScan = null
   try { projectScan = await scanProject('.', workingDir) } catch {}
   spin.stop()
 
   ui.workspaceInfo(workingDir, projectScan)
 
-  // Show last task hint
-  const wFiles = getWorkspaceFiles(workingDir)
+  // Last task hint
   try {
-    if (existsSync(wFiles.session)) {
-      const s = JSON.parse(await readFile(wFiles.session, 'utf8'))
+    const wf = getWorkspaceFiles(workingDir)
+    if (existsSync(wf.session)) {
+      const s = JSON.parse(await readFile(wf.session, 'utf8'))
       if (s.objective) {
         const short = String(s.objective).slice(0, 60)
         console.log(`  \x1b[38;5;245mLast task\x1b[0m  \x1b[2m"${short}${s.objective.length > 60 ? '…' : ''}"\x1b[0m`)
@@ -74,20 +72,14 @@ export async function runInteractive(options = {}) {
   }
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
-  rl.on('SIGINT', () => {
-    console.log('\n\x1b[36m  Goodbye ✨\x1b[0m\n')
-    rl.close(); process.exit(0)
-  })
+  rl.on('SIGINT', () => { console.log('\n\x1b[36m  Goodbye ✨\x1b[0m\n'); rl.close(); process.exit(0) })
 
   const ask = () => {
     rl.question('\x1b[1m\x1b[36mYou › \x1b[0m', async (raw) => {
       const input = raw.trim()
       if (!input) { ask(); return }
-      if (input.startsWith('/')) {
-        await handleSlash(input, workingDir, maxIterations, verbose, projectScan, rl)
-      } else {
-        await handleInput(input, workingDir, maxIterations, verbose, projectScan, rl)
-      }
+      if (input.startsWith('/')) await handleSlash(input, workingDir, maxIterations, verbose, projectScan, rl)
+      else await handleInput(input, workingDir, maxIterations, verbose, projectScan, rl)
       ask()
     })
   }
@@ -95,145 +87,165 @@ export async function runInteractive(options = {}) {
   return new Promise(resolve => rl.on('close', resolve))
 }
 
-// ─── Route to agent or chat ───────────────────────────────────────────────────
+// ─── Router ───────────────────────────────────────────────────────────────────
 async function handleInput(input, workingDir, maxIterations, verbose, projectScan, rl) {
-  if (looksLikeTask(input)) {
-    await runAgentTask(input, workingDir, maxIterations, verbose, projectScan, rl)
-  } else {
-    await runChatQuery(input, workingDir, verbose)
-  }
+  if (looksLikeTask(input)) await runAgentTask(input, workingDir, maxIterations, verbose, projectScan, rl)
+  else                       await runChatQuery(input, workingDir, verbose)
 }
 
-// ─── AGENT TASK with AUTO FIX MODE ───────────────────────────────────────────
+// ─── AGENT TASK — edit mode, smart status, auto-fix ──────────────────────────
 async function runAgentTask(objective, workingDir, maxIterations, verbose, projectScan, rl) {
   const isGenMode = looksLikeProjectGen(objective)
 
-  // Project gen: plan first, confirm, then execute
   if (isGenMode) {
     const confirmed = await projectGenConfirm(objective, workingDir, rl)
     if (!confirmed) { console.log('\x1b[2m  Cancelled.\x1b[0m\n'); return }
     console.log()
   }
 
-  // ── Track state for clean display ────────────────────────────────────────
-  let _lastTool   = null
-  let _lastParams = null
-  let filesCount  = 0
-  let errorCount  = 0
+  // ── State tracking ─────────────────────────────────────────────────────────
+  let _lastTool     = null
+  let _lastParams   = null
+  let _lastCmd      = ''
+  let filesCreated  = 0
+  let filesUpdated  = 0
+  let errorDetected = false
 
   const startTime = Date.now()
-  spin.start(isGenMode ? 'Generating project…' : 'Thinking…')
+
+  // Initial status
+  spin.set('⏳ Understanding Request...')
 
   const agent = new AetherAgent({
-    workingDir,
-    maxIterations,
-    verbose,
+    workingDir, maxIterations, verbose,
 
-    // ── Status ───────────────────────────────────────────────────────────
     onStatus(text) {
-      spin.update(text)
-    },
-
-    // ── Iteration — minimal step counter ─────────────────────────────────
-    onIteration(i, max) {
-      if (!isGenMode) {
-        spin.stop()
-        const bar = progressBar(i, max, 14)
-        console.log(`\n\x1b[90m── ${String(i).padStart(2)}/${max}  ${bar} ──\x1b[0m`)
+      // Only update if it's a meaningful status (not raw internal messages)
+      if (text && !text.startsWith('Loading') && !text.startsWith('Scanning')) {
+        spin.set(`⚙️ ${text}`)
       }
     },
 
-    // ── Thought — completely silent (just update spinner) ─────────────────
-    onThought(thought) {
-      // Extract a short hint for spinner without showing full thought
-      const hint = thought.trim().split('.')[0].slice(0, 60)
-      if (hint) spin.update(hint + '…')
+    // No iteration counter — clean edit mode
+    onIteration(i, max) {
+      // Silent — status line already shows what's happening
     },
 
-    // ── Action — SILENT TOOL MODE ─────────────────────────────────────────
+    // Thought: extract smart status, update line silently
+    onThought(thought) {
+      const status = thoughtToStatus(thought)
+      spin.set(status)
+    },
+
+    // Action: smart emoji status based on tool + command
     onAction(toolName, params) {
       _lastTool   = toolName
       _lastParams = params
-      spin.stop()
+      _lastCmd    = String(params?.command ?? '').toLowerCase()
 
-      // Detect build commands for special status
-      if (toolName === 'execute_command') {
-        const cmd = String(params?.command ?? '')
-        if (/npm (run )?build|tsc --/.test(cmd))     { ui.buildStart(); return }
-        if (/npm install|pnpm install/.test(cmd))    { spin.start('Installing dependencies…'); return }
-        if (/npm (run )?test|jest|vitest/.test(cmd)) { spin.start('Running tests…'); return }
-      }
-
-      // Count file writes silently
-      if (toolName === 'write_file') {
-        filesCount++
-        if (isGenMode) {
-          spin.start(`Creating files… [${filesCount}] ${params?.path ?? ''}`)
-          return
-        }
-      }
-
-      // Clean status — no raw tool name or params shown
-      const msg = toolStatusMsg(toolName, params)
-      spin.start(msg)
+      const status = smartStatus(toolName, params)
+      spin.set(status)
     },
 
-    // ── Observation — clean result display ────────────────────────────────
+    // Observation: interpret result, update status or print permanent line
     onObservation(obs) {
-      spin.stop()
       const tool   = _lastTool
       const params = _lastParams
-      const failed = obs.startsWith('ERROR') || obs.includes('COMMAND FAILED') || obs.startsWith('EXECUTOR ERROR')
+      const cmd    = _lastCmd
+      const failed = obs.startsWith('ERROR') ||
+                     obs.includes('COMMAND FAILED') ||
+                     obs.startsWith('EXECUTOR ERROR')
 
-      if (failed) {
-        errorCount++
-        // Show that we detected an error and are fixing automatically
-        if (tool === 'execute_command') {
-          const firstLine = obs.split('\n')
-            .map(l => l.trim())
-            .filter(l => l && !/^(npm warn|>|\s*$)/.test(l))
-            .find(l => l.length > 2) ?? 'Command failed'
-
-          // Show brief error + auto-fix notice
-          console.log(`\x1b[33m⚠\x1b[0m  \x1b[2m${firstLine.slice(0, 100)}\x1b[0m`)
-          console.log(`\x1b[36m↻\x1b[0m  Detecting error… analyzing… fixing automatically`)
-          spin.start('Analyzing error…')
+      // ── execute_command ─────────────────────────────────────────────────
+      if (tool === 'execute_command') {
+        if (failed) {
+          errorDetected = true
+          // Show the failure permanently, then show that we're fixing it
+          const errReason = extractFirstError(obs)
+          if (BUILD_CMDS.test(cmd)) {
+            ui.buildFail(errReason)
+          } else if (SERVER_CMDS.test(cmd)) {
+            ui.serverFail(errReason)
+          } else if (TEST_CMDS.test(cmd)) {
+            ui.testFail(errReason)
+          } else {
+            spin.stop()
+            console.log(`\x1b[31m✗\x1b[0m Command Failed`)
+            if (errReason) console.log(`\n  \x1b[1mReason:\x1b[0m\n  ${errReason}\n`)
+          }
+          // Auto-fix: show we're analyzing and continuing
+          spin.set('🔧 Analyzing error...')
         } else {
-          const msg = cleanObservation(tool, params, obs)
-          if (msg) console.log(msg)
+          // Success
+          if (BUILD_CMDS.test(cmd)) {
+            // Validate build output
+            const hasOutput = BUILD_OUT_DIRS.some(d => existsSync(join(workingDir, d)))
+            if (hasOutput) ui.buildSuccess()
+            else           ui.buildNoOutput()
+          } else if (SERVER_CMDS.test(cmd)) {
+            // Server started via execute_command (not start_server tool)
+            const url = obs.match(/https?:\/\/localhost:\d+[^\s]*/i)?.[0]
+            if (url) ui.serverReady(url, null)
+            else     ui.cmdSuccess('Server started')
+          } else if (TEST_CMDS.test(cmd)) {
+            const summary = extractTestSummary(obs)
+            ui.testPass(summary)
+          } else if (INSTALL_CMDS.test(cmd)) {
+            ui.cmdSuccess('Dependencies Installed')
+          } else {
+            // Generic — silent unless there's a brief useful line
+            const preview = obs.split('\n').filter(l => l.trim() && !l.startsWith('>') && !l.startsWith('npm')).slice(0, 1).join('').slice(0, 80)
+            if (preview) {
+              spin.stop()
+              console.log(`\x1b[32m✓\x1b[0m \x1b[2m${preview}\x1b[0m`)
+            }
+          }
         }
         return
       }
 
-      // Success — format cleanly
-      if (tool === 'execute_command') {
-        const cmd = String(params?.command ?? '')
-        if (/npm (run )?build|tsc --/.test(cmd)) {
-          ui.buildSuccess()
-          return
+      // ── start_server tool ────────────────────────────────────────────────
+      if (tool === 'start_server') {
+        if (failed || obs.startsWith('ERROR')) {
+          ui.serverFail(obs)
+        } else if (obs.includes('WARNING')) {
+          const url = obs.match(/URL tried: (\S+)/)?.[1] ?? obs.match(/Try manually: (\S+)/)?.[1]
+          ui.serverNotAccessible(url)
+        } else {
+          const localUrl = obs.match(/LOCAL: (\S+)/)?.[1]
+          const netUrl   = obs.match(/NETWORK: (\S+)/)?.[1]
+          ui.serverReady(localUrl, netUrl)
         }
-        if (/npm (run )?test|jest|vitest/.test(cmd)) {
-          console.log(`\x1b[32m✓\x1b[0m Tests passed`)
-          return
-        }
-        if (/npm install|pnpm install/.test(cmd)) {
-          console.log(`\x1b[32m✓\x1b[0m Dependencies installed`)
-          return
-        }
+        return
       }
 
-      const msg = cleanObservation(tool, params, obs)
-      if (msg) console.log(msg)
+      // ── File operations (silent — edit mode, no per-file spam) ───────────
+      if (tool === 'write_file') {
+        filesCreated++
+        if (isGenMode) {
+          spin.set(`📝 Creating files... [${filesCreated}] ${params?.path ?? ''}`)
+        } else {
+          spin.set(`📝 Writing ${params?.path ?? 'file'}... (${filesCreated} created)`)
+        }
+        return
+      }
+
+      if (tool === 'edit_file' || tool === 'append_file') {
+        filesUpdated++
+        spin.set(`✏️ Updating ${params?.path ?? 'file'}...`)
+        return
+      }
+
+      // ── Everything else: stay silent (update spinner) ────────────────────
+      spin.set(smartStatus(tool, params).replace('...', '. Done.'))
     },
 
-    // ── Final answer ──────────────────────────────────────────────────────
     onFinalAnswer(answer) {
       spin.stop()
       if (isGenMode) {
         const home = homedir()
         const dir  = workingDir.startsWith(home) ? '~' + workingDir.slice(home.length) : workingDir
-        ui.projectGenDone(filesCount, filesCount > 0 ? dir : null)
-        // Show only a brief non-code summary
+        ui.projectGenDone(filesCreated, filesCreated > 0 ? dir : null)
         const summary = stripCode(answer).split('\n').filter(l => l.trim()).slice(0, 4).join('\n')
         if (summary.trim()) console.log(`\x1b[2m${summary}\x1b[0m\n`)
       } else {
@@ -242,19 +254,18 @@ async function runAgentTask(objective, workingDir, maxIterations, verbose, proje
     },
 
     onError(msg) {
-      spin.stop()
-      // Suppress internal agent warnings in normal mode (they're noise)
-      if (verbose) console.log(`\x1b[90m[debug] ${msg}\x1b[0m`)
+      if (verbose) { spin.stop(); console.log(`\x1b[90m[debug] ${msg}\x1b[0m`) }
+      // In normal mode: silent — agent handles its own errors
     },
 
-    // ── Confirm destructive ops ───────────────────────────────────────────
+    // Confirm destructive operations
     async onBeforeAction(toolName, params) {
       if (!DESTRUCTIVE.has(toolName)) return true
       spin.stop()
-      const desc = describeAction(toolName, params)
+      const desc = describeDestructive(toolName, params)
       ui.confirmBox([`About to: \x1b[1m${desc}\x1b[0m`])
       return new Promise(resolve => {
-        rl.question('\n  Proceed? [\x1b[32mY\x1b[0m/\x1b[31mn\x1b[0m] ', ans => {
+        rl.question('  Proceed? [\x1b[32mY\x1b[0m/\x1b[31mn\x1b[0m] ', ans => {
           const yes = ans.trim().toLowerCase() !== 'n'
           if (!yes) console.log('\x1b[2m  Skipped.\x1b[0m')
           console.log()
@@ -268,13 +279,11 @@ async function runAgentTask(objective, workingDir, maxIterations, verbose, proje
     const result  = await agent.run(objective)
     spin.stop()
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
-
     if (!isGenMode) {
-      const mark = result.success ? '\x1b[32m✓\x1b[0m' : '\x1b[33m⚠\x1b[0m'
-      console.log(`${mark} \x1b[2mDone · ${result.iterations} steps · ${elapsed}s\x1b[0m\n`)
-      if (!result.success) {
+      const mark = result.success ? '\x1b[32m✓\x1b[0m' : '\x1b[33m⚠️\x1b[0m'
+      console.log(`${mark} \x1b[2mDone in ${elapsed}s\x1b[0m\n`)
+      if (!result.success)
         console.log('\x1b[2mTip: Run again to continue where AETHER left off.\x1b[0m\n')
-      }
     }
   } catch (err) {
     spin.stop()
@@ -286,10 +295,9 @@ async function runAgentTask(objective, workingDir, maxIterations, verbose, proje
 // ─── Chat mode ────────────────────────────────────────────────────────────────
 let _chatAgent = null
 async function runChatQuery(message, workingDir, verbose) {
-  if (!_chatAgent || _chatAgent.workingDir !== workingDir) {
+  if (!_chatAgent || _chatAgent.workingDir !== workingDir)
     _chatAgent = new AetherAgent({ workingDir, verbose })
-  }
-  spin.start('Thinking…')
+  spin.set('💭 Thinking...')
   try {
     const reply = await _chatAgent.chat(message)
     spin.stop()
@@ -303,17 +311,16 @@ async function runChatQuery(message, workingDir, verbose) {
 
 // ─── Project gen planning ─────────────────────────────────────────────────────
 async function projectGenConfirm(objective, workingDir, rl) {
-  spin.start('Planning project structure…')
+  spin.set('🤔 Planning project structure...')
   let planText = null
   try {
-    const prompt = `Project planner. User wants: "${objective}"\n\nList files to be created (one per line):\n- path/to/file.ext : description\n\nMax 20 files. No explanation, just the list.`
-    planText = await askGemini(prompt)
+    const p = `Project planner. User wants: "${objective}"\nList files to create (one per line):\n- path/to/file.ext : description\nMax 20 files. No explanation. Just the list.`
+    planText = await askGemini(p)
   } catch { spin.stop(); return true }
   spin.stop()
 
   const fileLines = planText.split('\n')
-    .filter(l => l.match(/^\s*[-•*]?\s*\S+\.\w+/))
-    .slice(0, 25)
+    .filter(l => l.match(/^\s*[-•*]?\s*\S+\.\w+/)).slice(0, 25)
 
   if (!fileLines.length) return true
 
@@ -325,8 +332,7 @@ async function projectGenConfirm(objective, workingDir, rl) {
 
   return new Promise(resolve => {
     rl.question('  Proceed? [\x1b[32mY\x1b[0m/\x1b[31mn\x1b[0m] ', ans => {
-      console.log()
-      resolve(ans.trim().toLowerCase() !== 'n')
+      console.log(); resolve(ans.trim().toLowerCase() !== 'n')
     })
   })
 }
@@ -338,35 +344,21 @@ async function handleSlash(input, workingDir, maxIterations, verbose, projectSca
 
   switch (cmd.toLowerCase()) {
     case 'help': case 'h':
-      console.log(`
-\x1b[1mCommands:\x1b[0m
-  \x1b[36m/scan\x1b[0m       Scan current project
-  \x1b[36m/memory\x1b[0m     View persistent memory
-  \x1b[36m/history\x1b[0m    Recent task history
-  \x1b[36m/serve\x1b[0m      Start dev server
-  \x1b[36m/run\x1b[0m \x1b[2m<cmd>\x1b[0m   Run a shell command
-  \x1b[36m/clear\x1b[0m      Clear screen
-  \x1b[36m/reset\x1b[0m      Clear chat history
-  \x1b[36m/exit\x1b[0m       Exit\n`)
+      console.log(`\n\x1b[1mCommands:\x1b[0m\n  \x1b[36m/scan\x1b[0m      Scan project\n  \x1b[36m/memory\x1b[0m    View memory\n  \x1b[36m/history\x1b[0m   Task history\n  \x1b[36m/serve\x1b[0m     Start dev server\n  \x1b[36m/run\x1b[0m \x1b[2m<cmd>\x1b[0m  Run shell command\n  \x1b[36m/clear\x1b[0m     Clear screen\n  \x1b[36m/reset\x1b[0m     Clear chat history\n  \x1b[36m/exit\x1b[0m      Exit\n`)
       break
 
     case 'clear':
-      console.clear()
-      ui.banner()
-      ui.workspaceInfo(workingDir, projectScan)
+      console.clear(); ui.banner(); ui.workspaceInfo(workingDir, projectScan)
       break
 
     case 'reset':
-      _chatAgent = null
-      console.log('\x1b[32m✓\x1b[0m Chat history cleared.\n')
+      _chatAgent = null; console.log('\x1b[32m✓\x1b[0m Chat history cleared.\n')
       break
 
     case 'scan': {
-      spin.start('Scanning project…')
-      try {
-        const result = await scanProject('.', workingDir)
-        spin.stop(); console.log(`\n${result}\n`)
-      } catch (err) { spin.fail(`Scan failed: ${err.message}`) }
+      spin.set('🔍 Scanning project...')
+      try { const r = await scanProject('.', workingDir); spin.stop(); console.log(`\n${r}\n`) }
+      catch (err) { spin.stop(); ui.error(`Scan failed: ${err.message}`) }
       break
     }
 
@@ -378,8 +370,7 @@ async function handleSlash(input, workingDir, maxIterations, verbose, projectSca
       console.log('\n\x1b[1mMemory\x1b[0m\n\x1b[90m' + '─'.repeat(40) + '\x1b[0m')
       console.log(ctx ?? '\x1b[2m(empty)\x1b[0m')
       if (last?.objective) {
-        console.log(`\n\x1b[1mLast Session\x1b[0m`)
-        console.log(`  ${String(last.objective).slice(0, 70)}`)
+        console.log(`\n\x1b[1mLast Session\x1b[0m\n  ${String(last.objective).slice(0, 70)}`)
         console.log(`  \x1b[2m${last.steps} steps · ${last.completedAt}\x1b[0m`)
       }
       console.log()
@@ -395,8 +386,7 @@ async function handleSlash(input, workingDir, maxIterations, verbose, projectSca
         console.log('\n\x1b[1mTask History\x1b[0m\n\x1b[90m' + '─'.repeat(50) + '\x1b[0m')
         hist.slice(-10).reverse().forEach((h, i) => {
           const ts = h.completedAt ? new Date(h.completedAt).toLocaleString() : ''
-          console.log(`  \x1b[36m${i+1}.\x1b[0m ${String(h.objective).slice(0,60)}`)
-          console.log(`     \x1b[2m${h.steps} steps · ${ts}\x1b[0m`)
+          console.log(`  \x1b[36m${i+1}.\x1b[0m ${String(h.objective).slice(0, 60)}\n     \x1b[2m${h.steps} steps · ${ts}\x1b[0m`)
         })
         console.log()
       } catch { console.log('\x1b[2m  No history.\x1b[0m\n') }
@@ -410,7 +400,7 @@ async function handleSlash(input, workingDir, maxIterations, verbose, projectSca
     case 'run': {
       if (!arg) { ui.error('Usage: /run <command>'); break }
       console.log(`\n\x1b[2m$ ${arg}\x1b[0m\n`)
-      spin.start(`Running: ${arg}`)
+      spin.set(`⚙️ Running: ${arg.slice(0, 50)}...`)
       try {
         const { exec } = await import('child_process')
         const { promisify } = await import('util')
@@ -424,7 +414,7 @@ async function handleSlash(input, workingDir, maxIterations, verbose, projectSca
         if (err.stdout) process.stdout.write(err.stdout)
         if (err.stderr) process.stderr.write('\x1b[31m' + err.stderr + '\x1b[0m')
         ui.error(`Failed (exit ${err.code ?? 1})`)
-        const fix = await askYN('  Fix with AETHER? [Y/n] ', rl)
+        const fix = await askYN('\n  Fix with AETHER? [Y/n] ', rl)
         if (fix) {
           const errOut = [err.stdout && `STDOUT:\n${err.stdout}`, err.stderr && `STDERR:\n${err.stderr}`].filter(Boolean).join('\n\n')
           await runAgentTask(`Fix the failing command: "${arg}"\n\nError:\n${errOut}`, workingDir, 12, verbose, projectScan, rl)
@@ -434,8 +424,7 @@ async function handleSlash(input, workingDir, maxIterations, verbose, projectSca
     }
 
     case 'exit': case 'quit': case 'q':
-      console.log('\n\x1b[36m  Goodbye ✨\x1b[0m\n')
-      rl.close(); process.exit(0)
+      console.log('\n\x1b[36m  Goodbye ✨\x1b[0m\n'); rl.close(); process.exit(0)
       break
 
     default:
@@ -444,83 +433,25 @@ async function handleSlash(input, workingDir, maxIterations, verbose, projectSca
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-function toolStatusMsg(toolName, params) {
-  const p = params ?? {}
-  switch (toolName) {
-    case 'read_file':        return `Reading ${p.path ?? 'file'}…`
-    case 'write_file':       return `Writing ${p.path ?? 'file'}…`
-    case 'edit_file':        return `Updating ${p.path ?? 'file'}…`
-    case 'append_file':      return `Updating ${p.path ?? 'file'}…`
-    case 'delete_file':      return `Deleting ${p.path ?? 'file'}…`
-    case 'delete_directory': return `Deleting ${p.path ?? 'directory'}…`
-    case 'create_directory': return `Creating ${p.path ?? 'directory'}…`
-    case 'list_directory':   return `Scanning ${p.path ?? '.'}…`
-    case 'search_files':     return `Searching…`
-    case 'project_scan':     return `Scanning project…`
-    case 'git_status':       return `Checking git…`
-    case 'git_add':          return `Staging changes…`
-    case 'git_commit':       return `Committing…`
-    case 'git_push':         return `Pushing…`
-    case 'memory_read':
-    case 'memory_write':     return `Memory…`
-    case 'start_server':     return `Starting server…`
-    case 'execute_command':  return `Running: ${String(p.command ?? '').slice(0, 50)}…`
-    default:                 return `Processing…`
-  }
+function extractFirstError(obs) {
+  return obs.split('\n')
+    .map(l => l.trim())
+    .filter(l => l && !/^(npm warn|>|\s*$|npm notice)/.test(l) && !/^\s*at /.test(l))
+    .find(l => /error|failed|cannot|not found|undefined|invalid|missing|unexpected/i.test(l))
+    ?? obs.split('\n').map(l => l.trim()).filter(l => l).find(l => l.length > 5)
+    ?? obs.slice(0, 120)
 }
 
-function cleanObservation(toolName, params, obs) {
-  const p   = params ?? {}
-  const ok  = !obs.startsWith('ERROR') && !obs.includes('COMMAND FAILED') && !obs.startsWith('EXECUTOR ERROR')
-  const G = '\x1b[32m✓\x1b[0m'
-  const E = '\x1b[31m✗\x1b[0m'
-
-  switch (toolName) {
-    case 'write_file':
-      return ok ? `${G} Created:  \x1b[2m${p.path}\x1b[0m` : `${E} Failed: ${p.path}`
-    case 'edit_file':
-    case 'append_file':
-      return ok ? `${G} Updated:  \x1b[2m${p.path}\x1b[0m` : `${E} Failed: ${p.path}`
-    case 'delete_file':
-    case 'delete_directory':
-      return ok ? `${G} Deleted:  \x1b[2m${p.path}\x1b[0m` : `${E} Delete failed`
-    case 'move_file':
-    case 'rename_file':
-      return ok ? `${G} Renamed:  \x1b[2m${p.source ?? p.path} → ${p.destination ?? p.newName}\x1b[0m` : `${E} Move failed`
-    case 'copy_file':
-      return ok ? `${G} Copied:   \x1b[2m${p.source} → ${p.destination}\x1b[0m` : `${E} Copy failed`
-    case 'create_directory':
-      return ok ? `${G} Folder:   \x1b[2m${p.path}\x1b[0m` : `${E} Folder failed`
-    case 'git_commit': return ok ? `${G} Committed` : `${E} Commit failed`
-    case 'git_push':   return ok ? `${G} Pushed`    : `${E} Push failed`
-    case 'start_server': {
-      if (!ok) return `${E} Server failed`
-      const url = obs.match(/https?:\/\/localhost:\d+[^\s]*/i)?.[0]
-      return url ? `${G} Server → \x1b[36m${url}\x1b[0m` : `${G} Server started`
-    }
-    // Silent for reads/scans
-    case 'read_file':
-    case 'list_directory':
-    case 'search_files':
-    case 'project_scan':
-    case 'memory_read':
-    case 'memory_write':
-      return null
-    default:
-      return ok ? null : `${E} Error in ${toolName}`
-  }
+function extractTestSummary(obs) {
+  const m = obs.match(/(\d+ (test|spec|suite).{0,40})/i)
+  return m ? m[1] : null
 }
 
 function stripCode(text) {
   return text.replace(/```[\s\S]*?```/g, '').replace(/`[^`\n]{30,}`/g, '').trim()
 }
 
-function progressBar(current, total, width) {
-  const filled = Math.round(Math.min(current / total, 1) * width)
-  return '\x1b[32m' + '█'.repeat(filled) + '\x1b[90m' + '░'.repeat(width - filled) + '\x1b[0m'
-}
-
-function describeAction(toolName, params) {
+function describeDestructive(toolName, params) {
   switch (toolName) {
     case 'delete_file':      return `delete file: ${params?.path}`
     case 'delete_directory': return `delete directory: ${params?.path}`
@@ -538,7 +469,5 @@ function printConnectionHint(err) {
 }
 
 async function askYN(question, rl) {
-  return new Promise(resolve => {
-    rl.question(question, ans => resolve(ans.trim().toLowerCase() !== 'n'))
-  })
+  return new Promise(resolve => { rl.question(question, ans => resolve(ans.trim().toLowerCase() !== 'n')) })
 }
