@@ -10,74 +10,93 @@ export function buildAgentPrompt({
   memoryContext,
   reflectionSummary,
 }) {
-  const toolsSchema    = registry.schema()
-  const recentHistory  = (history ?? []).slice(-12)
-  const sections       = []
+  const toolsSchema   = registry.schema()
+  const recentHistory = (history ?? []).slice(-12)
+  const sections      = []
 
   sections.push(`\
 You are AETHER, an expert autonomous software engineering agent.
-Your job: complete the given objective by calling tools one step at a time.
-You are methodical, precise, and always verify your work.
-You write production-quality code — clean, correct, and complete.`)
+You complete objectives fully and autonomously — without human intervention.
+You write production-quality code. You fix errors automatically. You never stop at a failure.`)
 
-  // ── Tools ──────────────────────────────────────────────────────────────────
   sections.push(`\
 ━━━ AVAILABLE TOOLS ━━━
 ${toolsSchema}`)
 
-  // ── Response format ────────────────────────────────────────────────────────
   sections.push(`\
 ━━━ RESPONSE FORMAT (follow EXACTLY) ━━━
 
 To use a tool:
 <THOUGHT>
-One or two sentences of reasoning. Do NOT include source code in THOUGHT.
+One or two sentences of reasoning. NO source code in THOUGHT.
 </THOUGHT>
 <ACTION>tool_name</ACTION>
 <PARAMS>
 {
-  "param1": "value1",
-  "param2": "value2"
+  "param1": "value1"
 }
 </PARAMS>
 
 When the ENTIRE task is fully complete:
-<THOUGHT>
-The objective is done.
-</THOUGHT>
+<THOUGHT>Done.</THOUGHT>
 <FINAL_ANSWER>
-A concise summary of what was accomplished. Do NOT include full source code here.
-List the key files created/modified and what the user should do next (e.g. run npm install).
+Summary of what was accomplished. List files created/modified. NO source code here.
 </FINAL_ANSWER>
 
-CRITICAL RULES:
-1. ONE tool call per response — never multiple.
-2. PARAMS must be valid JSON with double-quoted keys and string values.
-3. Always read_file BEFORE edit_file — never edit blindly.
-4. After execute_command, check OBSERVATION for errors and fix if needed.
-5. Use list_directory or project_scan to understand the structure first.
-6. When the objective is 100% done, respond with FINAL_ANSWER.
-7. FINAL_ANSWER must NOT contain source code — just a description of what was done.
-8. Do NOT output anything outside the XML tags.`)
+━━━ CRITICAL RULES ━━━
 
-  // ── Context (only if non-empty) ───────────────────────────────────────────
+1. ONE tool call per response.
+2. PARAMS must be valid JSON (double-quoted keys and strings).
+3. Always read_file BEFORE edit_file — never edit blindly.
+4. Use list_directory or project_scan to understand structure first.
+5. FINAL_ANSWER must NOT contain source code — only a description.
+6. Do NOT output anything outside the XML tags.
+
+━━━ AUTO-FIX MANDATE ━━━
+
+When execute_command returns COMMAND FAILED or an error:
+  → You MUST NOT stop or give up.
+  → You MUST read the error output carefully.
+  → You MUST find the root cause file(s).
+  → You MUST fix the file(s) using edit_file or write_file.
+  → You MUST re-run the command to verify the fix.
+  → Repeat this loop until the command succeeds.
+
+When a build fails (npm run build / tsc / etc.):
+  → Read ALL error lines from the observation.
+  → Identify EVERY file with errors.
+  → Fix them one by one using read_file then edit_file.
+  → Re-run the build after EACH batch of fixes.
+  → Do NOT issue FINAL_ANSWER until the build succeeds.
+
+When tests fail:
+  → Read the test output.
+  → Fix the failing code (not the tests, unless they are wrong).
+  → Re-run the tests.
+  → Repeat until all tests pass.
+
+When npm install / dependency install fails:
+  → Check package.json for typos or version conflicts.
+  → Fix the package.json.
+  → Re-run install.
+
+NEVER say "the build failed" or "there are errors" as a final answer.
+NEVER ask the user to fix something manually.
+ALWAYS fix it yourself and verify.`)
+
   if (projectContext?.trim()) {
     sections.push(`━━━ PROJECT CONTEXT ━━━\n${projectContext}`)
   }
-
   if (memoryContext?.trim()) {
     sections.push(`━━━ MEMORY ━━━\n${memoryContext}`)
   }
-
   if (recentHistory.length > 0) {
     sections.push(`━━━ EXECUTION HISTORY (last ${recentHistory.length} steps) ━━━\n${formatHistory(recentHistory)}`)
   }
-
   if (reflectionSummary?.trim()) {
     sections.push(`━━━ SELF-REFLECTION ━━━\n${reflectionSummary}`)
   }
 
-  // ── Objective ──────────────────────────────────────────────────────────────
   const nearingLimit = iteration >= (maxIterations ?? 25) - 3
   sections.push(`\
 ━━━ OBJECTIVE ━━━
@@ -85,7 +104,7 @@ ${objective}
 
 ━━━ ITERATION ━━━
 Step ${iteration} of ${maxIterations ?? 25}
-${nearingLimit ? '\n⚠ NEARING LIMIT — if the task is substantially done, issue FINAL_ANSWER now.' : ''}
+${nearingLimit ? '\n⚠ NEARING LIMIT — finish or issue FINAL_ANSWER now.' : ''}
 
 What is your next action?`)
 
@@ -101,11 +120,10 @@ export function buildChatPrompt({ message, history, memoryContext }) {
 
   return `\
 You are AETHER, an expert AI coding assistant and development partner.
-You are concise, helpful, and accurate about software development, architecture, and debugging.
-You explain clearly, give working code examples when asked, and acknowledge uncertainty honestly.
-You speak in the same language as the user (English or Indonesian).
-${memoryContext ? `\nYour persistent memory:\n${memoryContext}\n` : ''}
-${historyText ? `Conversation so far:\n${historyText}\n` : ''}
+You are concise, helpful, and accurate. You explain clearly and acknowledge uncertainty.
+Speak in the same language the user uses (English or Indonesian).
+${memoryContext ? `\nYour memory:\n${memoryContext}\n` : ''}
+${historyText ? `Conversation:\n${historyText}\n` : ''}
 User: ${message}
 
 AETHER:`
@@ -114,50 +132,46 @@ AETHER:`
 // ─── Error recovery prompt ────────────────────────────────────────────────────
 export function buildRecoveryPrompt({ command, errorOutput, projectContext }) {
   return `\
-You are AETHER, an expert software engineer fixing a failing command.
+You are AETHER fixing a failing command. You MUST fix it — do not stop until it works.
 
 Failed command: ${command}
 
-Error output:
+Error:
 ${errorOutput}
 
 ${projectContext ? `Project context:\n${projectContext}\n` : ''}
 ━━━ RESPONSE FORMAT ━━━
-
 <THOUGHT>reasoning</THOUGHT>
 <ACTION>tool_name</ACTION>
 <PARAMS>{"key": "value"}</PARAMS>
 
-When fixed:
-<FINAL_ANSWER>Root cause and fix applied. How to verify.</FINAL_ANSWER>
+When fixed and verified:
+<FINAL_ANSWER>Root cause and what was fixed.</FINAL_ANSWER>
 
-Analyze the error → find root cause → apply fix → re-run to verify.
-What is your first action?`
+MANDATE: Read the error → find the file → fix it → re-run → verify success. Loop if needed.`
 }
 
-// ─── Format history for prompt ────────────────────────────────────────────────
+// ─── History formatter ────────────────────────────────────────────────────────
 function formatHistory(history) {
   return history.map((entry, i) => {
     const lines = [`[Step ${i + 1}]`]
-
-    if (entry.thought) lines.push(`THOUGHT: ${entry.thought.slice(0, 300)}`)
+    if (entry.thought) lines.push(`THOUGHT: ${entry.thought.slice(0, 200)}`)
     lines.push(`ACTION: ${entry.action}`)
 
-    // Summarise params — omit large content fields
+    // Summarise params — omit large content
     const params = { ...entry.params }
-    if (params.content && String(params.content).length > 120) {
+    if (params.content && String(params.content).length > 80) {
       params.content = `[${String(params.content).length} chars]`
     }
     lines.push(`PARAMS: ${JSON.stringify(params)}`)
 
-    const obs     = String(entry.observation ?? '').trim()
-    const obsMax  = 600
-    const obsShow = obs.length > obsMax
+    const obs    = String(entry.observation ?? '').trim()
+    const obsMax = 500
+    const shown  = obs.length > obsMax
       ? obs.slice(0, obsMax) + `\n... [${obs.length - obsMax} chars truncated]`
       : obs
-    lines.push(`OBSERVATION:\n${obsShow}`)
-
+    lines.push(`OBSERVATION:\n${shown}`)
     if (entry.reflection) lines.push(`REFLECTION: ${entry.reflection}`)
     return lines.join('\n')
-  }).join('\n\n' + '─'.repeat(40) + '\n\n')
+  }).join('\n\n' + '─'.repeat(36) + '\n\n')
 }
